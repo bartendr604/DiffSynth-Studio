@@ -195,70 +195,73 @@ class FluxLoRAFromCivitai(LoRAFromCivitai):
             "txt.mod": "txt_mod",
         }
 
-
+    
+    
 class GeneralLoRAFromPeft:
     def __init__(self):
         self.supported_model_classes = [SDUNet, SDXLUNet, SD3DiT, HunyuanDiT, FluxDiT, CogDiT, WanModel]
-
-
-    def fetch_device_dtype_from_state_dict(self, state_dict):
-        device, torch_dtype = None, None
-        for name, param in state_dict.items():
-            device, torch_dtype = param.device, param.dtype
-            break
-        return device, torch_dtype
-
-
-    def convert_state_dict(self, state_dict, alpha=1.0, target_state_dict={}):
-        device, torch_dtype = self.fetch_device_dtype_from_state_dict(target_state_dict)
-        state_dict_ = {}
-        for key in state_dict:
+    
+    
+    def get_name_dict(self, lora_state_dict):
+        lora_name_dict = {}
+        for key in lora_state_dict:
             if ".lora_B." not in key:
                 continue
-            weight_up = state_dict[key].to(device=device, dtype=torch_dtype)
-            weight_down = state_dict[key.replace(".lora_B.", ".lora_A.")].to(device=device, dtype=torch_dtype)
-            if len(weight_up.shape) == 4:
-                weight_up = weight_up.squeeze(3).squeeze(2)
-                weight_down = weight_down.squeeze(3).squeeze(2)
-                lora_weight = alpha * torch.mm(weight_up, weight_down).unsqueeze(2).unsqueeze(3)
-            else:
-                lora_weight = alpha * torch.mm(weight_up, weight_down)
             keys = key.split(".")
             if len(keys) > keys.index("lora_B") + 2:
                 keys.pop(keys.index("lora_B") + 1)
             keys.pop(keys.index("lora_B"))
+            if keys[0] == "diffusion_model":
+                keys.pop(0)
             target_name = ".".join(keys)
-            if target_name not in target_state_dict:
-                return {}
-            state_dict_[target_name] = lora_weight.cpu()
-        return state_dict_
+            lora_name_dict[target_name] = (key, key.replace(".lora_B.", ".lora_A."))
+        return lora_name_dict
     
+    
+    def match(self, model: torch.nn.Module, state_dict_lora):
+        lora_name_dict = self.get_name_dict(state_dict_lora)
+        model_name_dict = {name: None for name, _ in model.named_parameters()}
+        matched_num = sum([i in model_name_dict for i in lora_name_dict])
+        if matched_num == len(lora_name_dict):
+            return "", ""
+        else:
+            return None
+    
+    
+    def fetch_device_and_dtype(self, state_dict):
+        device, dtype = None, None
+        for name, param in state_dict.items():
+            device, dtype = param.device, param.dtype
+            break
+        computation_device = device
+        computation_dtype = dtype
+        if computation_device == torch.device("cpu"):
+            if torch.cuda.is_available():
+                computation_device = torch.device("cuda")
+        if computation_dtype == torch.float8_e4m3fn:
+            computation_dtype = torch.float32
+        return device, dtype, computation_device, computation_dtype
+
 
     def load(self, model, state_dict_lora, lora_prefix="", alpha=1.0, model_resource=""):
         state_dict_model = model.state_dict()
-        state_dict_lora = self.convert_state_dict(state_dict_lora, alpha=alpha, target_state_dict=state_dict_model)
-        if len(state_dict_lora) > 0:
-            print(f"    {len(state_dict_lora)} tensors are updated.")
-            for name in state_dict_lora:
-                state_dict_model[name] += state_dict_lora[name].to(
-                    dtype=state_dict_model[name].dtype,
-                    device=state_dict_model[name].device
-                )
-            model.load_state_dict(state_dict_model)
+        device, dtype, computation_device, computation_dtype = self.fetch_device_and_dtype(state_dict_model)
+        lora_name_dict = self.get_name_dict(state_dict_lora)
+        for name in lora_name_dict:
+            weight_up = state_dict_lora[lora_name_dict[name][0]].to(device=computation_device, dtype=computation_dtype)
+            weight_down = state_dict_lora[lora_name_dict[name][1]].to(device=computation_device, dtype=computation_dtype)
+            if len(weight_up.shape) == 4:
+                weight_up = weight_up.squeeze(3).squeeze(2)
+                weight_down = weight_down.squeeze(3).squeeze(2)
+                weight_lora = alpha * torch.mm(weight_up, weight_down).unsqueeze(2).unsqueeze(3)
+            else:
+                weight_lora = alpha * torch.mm(weight_up, weight_down)
+            weight_model = state_dict_model[name].to(device=computation_device, dtype=computation_dtype)
+            weight_patched = weight_model + weight_lora
+            state_dict_model[name] = weight_patched.to(device=device, dtype=dtype)
+        print(f"    {len(lora_name_dict)} tensors are updated.")
+        model.load_state_dict(state_dict_model)
     
-
-    def match(self, model, state_dict_lora):
-        for model_class in self.supported_model_classes:
-            if not isinstance(model, model_class):
-                continue
-            state_dict_model = model.state_dict()
-            try:
-                state_dict_lora_ = self.convert_state_dict(state_dict_lora, alpha=1.0, target_state_dict=state_dict_model)
-                if len(state_dict_lora_) > 0:
-                    return "", ""
-            except:
-                pass
-        return None
     
 
 class HunyuanVideoLoRAFromCivitai(LoRAFromCivitai):
@@ -274,7 +277,7 @@ class FluxLoRAConverter:
         pass
 
     @staticmethod
-    def align_to_opensource_format(state_dict, alpha=1.0):
+    def align_to_opensource_format(state_dict, alpha=None):
         prefix_rename_dict = {
             "single_blocks": "lora_unet_single_blocks",
             "blocks": "lora_unet_double_blocks",
@@ -313,7 +316,8 @@ class FluxLoRAConverter:
             rename = prefix_rename_dict[prefix] + "_" + block_id + "_" + middle_rename_dict[middle] + "." + suffix_rename_dict[suffix]
             state_dict_[rename] = param
             if rename.endswith("lora_up.weight"):
-                state_dict_[rename.replace("lora_up.weight", "alpha")] = torch.tensor((alpha,))[0]
+                lora_alpha = alpha if alpha is not None else param.shape[-1]
+                state_dict_[rename.replace("lora_up.weight", "alpha")] = torch.tensor((lora_alpha,))[0]
         return state_dict_
     
     @staticmethod
@@ -362,7 +366,22 @@ class FluxLoRAConverter:
             else:
                 state_dict_[name] = param
         return state_dict_
+
+
+class WanLoRAConverter:
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def align_to_opensource_format(state_dict, **kwargs):
+        state_dict = {"diffusion_model." + name.replace(".default.", "."): param for name, param in state_dict.items()}
+        return state_dict
     
+    @staticmethod
+    def align_to_diffsynth_format(state_dict, **kwargs):
+        state_dict = {name.replace("diffusion_model.", "").replace(".lora_A.weight", ".lora_A.default.weight").replace(".lora_B.weight", ".lora_B.default.weight"): param for name, param in state_dict.items()}
+        return state_dict
+
 
 def get_lora_loaders():
     return [SDLoRAFromCivitai(), SDXLLoRAFromCivitai(), FluxLoRAFromCivitai(), HunyuanVideoLoRAFromCivitai(), GeneralLoRAFromPeft()]

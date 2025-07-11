@@ -261,7 +261,6 @@ def add_general_parsers(parser):
         default=None,
         help="SwanLab mode (cloud or local).",
     )
-    
     return parser
 
 
@@ -281,8 +280,7 @@ def launch_training_task(model, args):
         batch_size=args.batch_size,
         num_workers=args.dataloader_num_workers
     )
-
-    # set swanlab logger
+    # train
     if args.use_swanlab:
         from swanlab.integration.pytorch_lightning import SwanLabLogger
         swanlab_config = {"UPPERFRAMEWORK": "DiffSynth-Studio"}
@@ -292,13 +290,11 @@ def launch_training_task(model, args):
             name="diffsynth_studio",
             config=swanlab_config,
             mode=args.swanlab_mode,
-            logdir=args.output_path,
+            logdir=os.path.join(args.output_path, "swanlog"),
         )
-        logger = [swanlab_config]
+        logger = [swanlab_logger]
     else:
-        logger = []
-
-    # train
+        logger = None
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator="gpu",

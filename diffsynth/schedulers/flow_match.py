@@ -15,7 +15,9 @@ class FlowMatchScheduler():
         self.set_timesteps(num_inference_steps)
 
 
-    def set_timesteps(self, num_inference_steps=100, denoising_strength=1.0, training=False):
+    def set_timesteps(self, num_inference_steps=100, denoising_strength=1.0, training=False, shift=None):
+        if shift is not None:
+            self.shift = shift
         sigma_start = self.sigma_min + (self.sigma_max - self.sigma_min) * denoising_strength
         if self.extra_one_step:
             self.sigmas = torch.linspace(sigma_start, self.sigma_min, num_inference_steps + 1)[:-1]
@@ -33,9 +35,12 @@ class FlowMatchScheduler():
             y_shifted = y - y.min()
             bsmntw_weighing = y_shifted * (num_inference_steps / y_shifted.sum())
             self.linear_timesteps_weights = bsmntw_weighing
+            self.training = True
+        else:
+            self.training = False
 
 
-    def step(self, model_output, timestep, sample, to_final=False):
+    def step(self, model_output, timestep, sample, to_final=False, **kwargs):
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
         timestep_id = torch.argmin((self.timesteps - timestep).abs())
